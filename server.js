@@ -261,6 +261,29 @@ function handleRoomMessage(conn, room, pid, msg) {
       manager.broadcast(room);
       return;
     }
+    case 'item': {
+      // 使用道具：kind=3 随机传送 / 1 破墙 / 2 陷阱
+      const res = manager.useItem(room, pid, msg.kind, msg.data || {});
+      if (res.error) return reply(conn, { t: 'error', msg: res.error });
+      manager.broadcast(room);
+      return;
+    }
+    case 'danmaku': {
+      const res = manager.danmaku(room, pid, msg.text);
+      if (res.error) return reply(conn, { t: 'error', msg: res.error });
+      // 弹幕是广播性内容，直接推给所有人（不需要重发整份 state）
+      const payload = { t: 'danmaku', entry: res.entry };
+      for (const p of room.players.values()) {
+        if (p.conn?.ready) reply(p.conn, payload);
+      }
+      return;
+    }
+    case 'react': {
+      // 头像互动：由 manager.react 精确下发两份不同视角的特效事件
+      const res = manager.react(room, pid, makePid(msg.target), msg.kind);
+      if (res.error) return reply(conn, { t: 'error', msg: res.error });
+      return;
+    }
     case 'kick': {
       const res = manager.kick(room, pid, makePid(msg.pid));
       if (res.error) return reply(conn, { t: 'error', msg: res.error });

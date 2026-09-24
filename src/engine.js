@@ -30,12 +30,45 @@ export const DIRS = [
   { dr: 0, dc: -1 },
 ];
 
+/** 道具种类：3 随机传送、1 破墙、2 陷阱。数字与 ITEM_COLORS 下标一一对应。 */
+export const ITEM_KIND = { TELEPORT: 3, BREAK: 1, TRAP: 2 };
+
+export const ITEM_META = [
+  { kind: ITEM_KIND.TELEPORT, key: 'teleport', icon: '🎲', name: '随机传送', color: '#a06bff' },
+  { kind: ITEM_KIND.BREAK, key: 'break', icon: '🔨', name: '破墙锤', color: '#ff7a3d' },
+  { kind: ITEM_KIND.TRAP, key: 'trap', icon: '💣', name: '陷阱', color: '#ff3d6e' },
+];
+
+export const ITEM_KEYS = ITEM_META.map((m) => m.key);
+export const ALL_ITEM_KEYS = [...ITEM_KEYS];
+
+const ITEM_BY_KIND = new Map(ITEM_META.map((m) => [m.kind, m]));
+
+export function itemMetaByKind(kind) {
+  return ITEM_BY_KIND.get(kind) || null;
+}
+
+export function itemMetaByKey(key) {
+  return ITEM_META.find((m) => m.key === key) || null;
+}
+
+/** key -> kind 的数字映射，专门给「开关数组」形式的设置用。 */
+export const ITEM_KIND_BY_KEY = {
+  teleport: ITEM_KIND.TELEPORT,
+  break: ITEM_KIND.BREAK,
+  trap: ITEM_KIND.TRAP,
+};
+
 export const DEFAULT_SETTINGS = {
   size: 9,
   walls: 10,
   goalSize: 1,
   turnTimer: 60,
   maxPlayers: 4,
+  chests: 0,
+  chestOnce: true,
+  chestItems: ALL_ITEM_KEYS,
+  itemSlots: 3,
 };
 
 const clampInt = (value, min, max, fallback) => {
@@ -49,6 +82,35 @@ export function defaultWallsFor(size) {
   return clampInt(Math.round((size * 10) / 9), 0, 20, 10);
 }
 
+/**
+ * 宝箱可产出道具池。接受字符串数组 / 数字数组 / 布尔开关对象；
+ * 空池回落到「全部道具」，避免房主勾没了导致宝箱永远开不出东西。
+ */
+export function normalizeChestItems(input) {
+  if (input === undefined || input === null || input === '') return [...ALL_ITEM_KEYS];
+  const kinds = new Set();
+  if (Array.isArray(input)) {
+    for (const v of input) {
+      if (typeof v === 'string') {
+        const k = ITEM_KIND_BY_KEY[v];
+        if (k) kinds.add(k);
+      } else if (ITEM_BY_KIND.has(Number(v))) {
+        kinds.add(Number(v));
+      }
+    }
+  } else if (typeof input === 'object') {
+    for (const [key, on] of Object.entries(input)) {
+      const k = ITEM_KIND_BY_KEY[key];
+      if (on && k) kinds.add(k);
+    }
+  } else {
+    return [...ALL_ITEM_KEYS];
+  }
+  if (!kinds.size) return [...ALL_ITEM_KEYS];
+  // 按 ITEM_META 的固定顺序输出，保证前端勾选框与广播内容稳定
+  return ITEM_META.filter((m) => kinds.has(m.kind)).map((m) => m.key);
+}
+
 export function normalizeSettings(input) {
   const raw = input && typeof input === 'object' ? input : {};
   let size = clampInt(raw.size, 5, 15, DEFAULT_SETTINGS.size);
@@ -59,6 +121,10 @@ export function normalizeSettings(input) {
     goalSize: Number(raw.goalSize) >= 2 ? 2 : 1,
     turnTimer: clampInt(raw.turnTimer, 0, 300, DEFAULT_SETTINGS.turnTimer),
     maxPlayers: clampInt(raw.maxPlayers, 2, 4, 4),
+    chests: clampInt(raw.chests, 0, 10, DEFAULT_SETTINGS.chests),
+    chestOnce: raw.chestOnce === undefined ? DEFAULT_SETTINGS.chestOnce : !!raw.chestOnce,
+    chestItems: normalizeChestItems(raw.chestItems),
+    itemSlots: clampInt(raw.itemSlots, 1, 5, DEFAULT_SETTINGS.itemSlots),
   };
 }
 
@@ -134,7 +200,7 @@ export function createGame(settings, seats) {
   const pawns = [];
   for (let i = 0; i < s.maxPlayers; i++) pawns.push(i < list.length ? { ...starts[i] } : null);
 
-  return {
+  const g = {
     size: n,
     goalSize: s.goalSize,
     wallsPerPlayer: s.walls,
@@ -150,6 +216,15 @@ export function createGame(settings, seats) {
     hs: Array.from({ length: n + 1 }, () => new Array(n + 1).fill(0)),
     vs: Array.from({ length: n + 1 }, () => new Array(n + 1).fill(0)),
     walls: [],
+    // 陷阱：公开数据（谁埋的也公开），但「埋在哪」只发给埋雷的人，见 rooms.js
+    traps: [],
+    // 每个座位的临时状态（跳过回合的层数）
+    seatState: list.map(() => ({ skipTurns: 0 })),
+    // 宝箱配置：一次性模式（chestOnce）下 openedBy 用来记录已开过的玩家
+    chestMode: s.chestOnce ? 'once' : 'forever',
+    chestPool: s.chestItems,
+    itemSlots: s.itemSlots,
+    chests: [],
     seats: list.map((p, i) => ({
       seat: i,
       id: p.id,
@@ -159,6 +234,36 @@ export function createGame(settings, seats) {
       connected: true,
     })),
   };
+  // 宝箱随机落在非目标格上。RNG 在客户端（大厅预览）也一致可用。
+  g.chests = placeChests(g, s.chests);
+  return g;
+}
+
+/**
+ * 在棋盘上随机挑选若干非目标格放宝箱（不会重复落点）。
+ * 导出出来是为了让房间管理在「同一局内补种宝箱」时复用同一套规则。
+ */
+export function placeChests(g, count, rng = Math.random) {
+  const total = clampInt(count, 0, 10, 0);
+  const taken = new Set();
+  const out = [];
+  const pool = [];
+  const goals = goalSet(g.size, g.goalSize);
+  for (let r = 0; r < g.size; r++) {
+    for (let c = 0; c < g.size; c++) {
+      if (goals.has(`${r},${c}`)) continue;
+      pool.push({ r, c });
+    }
+  }
+  for (let i = 0; i < total && pool.length; i++) {
+    const idx = Math.floor(rng() * pool.length);
+    const cell = pool.splice(idx, 1)[0];
+    const key = `${cell.r},${cell.c}`;
+    if (taken.has(key)) continue;
+    taken.add(key);
+    out.push({ id: i, r: cell.r, c: cell.c, openedBy: [] });
+  }
+  return out;
 }
 
 /** 用「玩家名单 + 已有对局配置」开一局新棋（用于快速重开）。 */
@@ -235,6 +340,7 @@ export function legalMoves(g, seat) {
 export function applyMove(g, seat, r, c) {
   if (g.phase !== 'playing') return { ok: false, reason: 'not-playing' };
   if (g.turn !== seat) return { ok: false, reason: 'not-turn' };
+  if (g.seatState?.[seat]?.skipTurns > 0) return { ok: false, reason: 'skipped' };
   const pawn = g.pawns[seat];
   if (!pawn) return { ok: false, reason: 'no-seat' };
 
@@ -245,14 +351,85 @@ export function applyMove(g, seat, r, c) {
   pawn.r = r;
   pawn.c = c;
   g.lastMove = { type: 'move', seat, from, to: { r, c } };
-  g.turnCount++;
+
+  return settleAfterArrival(g, seat, r, c, 'move');
+}
+
+/**
+ * 棋子落到某格之后的统一结算：开宝箱 → 踩陷阱 → 判断胜负 → 换手。
+ * 走子与随机传送都走这条路径（「任何方式移动到宝箱格」都能拿到道具）。
+ */
+export function settleAfterArrival(g, seat, r, c, kind = 'move') {
+  const chest = openChestAt(g, seat, r, c);
+  const trap = triggerTrapAt(g, seat, r, c);
 
   if (isGoal(g, r, c)) {
     g.phase = 'finished';
     g.winner = seat;
-  } else {
-    advanceTurn(g);
+    return { ok: true, opened: chest, trapped: !!trap, won: true };
   }
+
+  const skipped = trap ? markSkip(g, seat, 1) : false;
+  g.turnCount++;
+  advanceTurn(g);
+  return { ok: true, opened: chest, trapped: !!trap, skipped, won: false };
+}
+
+/** 棋子所在格的宝箱；没有则返回 null。 */
+export function chestAt(g, r, c) {
+  return (g.chests || []).find((ch) => ch.r === r && ch.c === c) || null;
+}
+
+/**
+ * 开启 (r, c) 上的宝箱。
+ * 返回 { chestId, index }，没开成（没有箱子 / 一次性已开过 / 道具池为空）返回 null。
+ * 注意：这里只改「宝箱被谁开过」，发道具由房间管理写入私有背包。
+ */
+export function openChestAt(g, seat, r, c) {
+  const chest = chestAt(g, r, c);
+  if (!chest) return null;
+  const opened = chest.openedBy || (chest.openedBy = []);
+  if (g.chestMode === 'once' && opened.length) return null;
+  if (g.chestMode === 'forever' && opened.includes(seat)) return null;
+  if (!g.chestPool?.length) return null;
+  opened.push(seat);
+  return { chestId: chest.id, index: (g.chests || []).indexOf(chest) };
+}
+
+/** 触发 (r, c) 上的陷阱。返回 { index, owner } 或 null。 */
+export function triggerTrapAt(g, seat, r, c) {
+  const traps = g.traps || [];
+  const index = traps.findIndex((t) => t.r === r && t.c === c && t.seat !== seat);
+  if (index < 0) return null;
+  const [trap] = traps.splice(index, 1);
+  return { index, owner: trap.seat };
+}
+
+/** 本回合跳过 skipTurns 次；返回是否真的标记成功。 */
+export function markSkip(g, seat, skipTurns = 1) {
+  if (!g.seatState?.[seat]) return false;
+  g.seatState[seat].skipTurns = Math.max(g.seatState[seat].skipTurns || 0, skipTurns);
+  return true;
+}
+
+/** 当前座位上是否处于「跳过回合」状态。 */
+export function isSkipped(g, seat) {
+  return (g.seatState?.[seat]?.skipTurns || 0) > 0;
+}
+
+/**
+ * 结算一次「被跳过的回合」：消耗一层跳过标记并换手。
+ * 返回 { ok, finished }；没有跳过标记时返回 { ok:false }。
+ */
+export function skipTurn(g, seat) {
+  if (g.phase !== 'playing') return { ok: false, reason: 'not-playing' };
+  if (g.turn !== seat) return { ok: false, reason: 'not-turn' };
+  const st = g.seatState?.[seat];
+  if (!st || !(st.skipTurns > 0)) return { ok: false, reason: 'not-skipped' };
+  st.skipTurns--;
+  g.lastMove = { type: 'skip', seat };
+  g.turnCount++;
+  advanceTurn(g);
   return { ok: true };
 }
 
@@ -280,6 +457,7 @@ const fails = (reason, extra) => ({ ok: false, reason, ...extra });
 export function canPlaceWall(g, seat, d, r, c) {
   if (g.phase !== 'playing') return fails('not-playing');
   if (g.turn !== seat) return fails('not-turn');
+  if (isSkipped(g, seat)) return fails('skipped');
 
   const info = g.seats[seat];
   if (!info) return fails('no-seat');
@@ -355,7 +533,75 @@ export function applyWall(g, seat, d, r, c) {
   g.lastMove = { type: 'wall', seat, d, r: check.r, c: check.c };
   g.turnCount++;
   advanceTurn(g);
+  return { ok: true, r: check.r, c: check.c, count: g.walls.length };
+}
+
+/* ------------------------------------------------------------------ */
+/* 道具与陷阱                                                          */
+/* ------------------------------------------------------------------ */
+
+/** 破坏一面路障（破墙道具）。只能砸对手的墙。 */
+export function removeWall(g, seat, index) {
+  if (g.phase !== 'playing') return fails('not-playing');
+  if (g.turn !== seat) return fails('not-turn');
+  if (isSkipped(g, seat)) return fails('skipped');
+  const wall = g.walls[index];
+  if (!wall) return fails('no-wall');
+  if (wall.seat === seat) return fails('own-wall');
+
+  setWall(g, wall.d, wall.r, wall.c, false);
+  g.walls.splice(index, 1);
+  return { ok: true, removed: wall };
+}
+
+/**
+ * 随机传送：落到棋盘上随机一格（可以是空闲格、也可以是别人棋子/宝箱/陷阱所在格）。
+ * 唯一硬性排除是中央目标格——不能靠传送直接获胜。
+ * rng 可注入，测试里用来固定落点。
+ */
+export function randomTeleportCell(g, seat, rng = Math.random) {
+  const pool = [];
+  const goals = goalSet(g.size, g.goalSize);
+  for (let r = 0; r < g.size; r++) {
+    for (let c = 0; c < g.size; c++) {
+      if (goals.has(`${r},${c}`)) continue; // 不能传送到终点
+      const self = g.pawns[seat];
+      if (self && self.r === r && self.c === c) continue; // 传送原地没意义
+      pool.push({ r, c });
+    }
+  }
+  if (!pool.length) return null;
+  return pool[Math.floor(rng() * pool.length)];
+}
+
+/** 陷阱不能埋在中央目标格上（房主可勾选的「任一位置」按此口径执行）。 */
+export function canPlaceTrap(g, seat, r, c) {
+  if (g.phase !== 'playing') return fails('not-playing');
+  if (g.turn !== seat) return fails('not-turn');
+  if (isSkipped(g, seat)) return fails('skipped');
+  const rr = Math.round(Number(r));
+  const cc = Math.round(Number(c));
+  if (!Number.isFinite(rr) || !Number.isFinite(cc)) return fails('out-of-board');
+  if (!inBoard(g.size, rr, cc)) return fails('out-of-board');
+  if (isGoal(g, rr, cc)) return fails('trap-on-goal');
+  if ((g.traps || []).some((t) => t.r === rr && t.c === cc)) return fails('trap-occupied');
+  return { ok: true, r: rr, c: cc };
+}
+
+export function applyPlaceTrap(g, seat, r, c) {
+  const check = canPlaceTrap(g, seat, r, c);
+  if (!check.ok) return check;
+  g.traps = g.traps || [];
+  g.traps.push({ r: check.r, c: check.c, seat });
   return { ok: true, r: check.r, c: check.c };
+}
+
+/** 清理所有过期的临时状态（跳过标记）并推进到下一个能行动的座位。 */
+export function clearExpired(g) {
+  if (!g.seatState) return;
+  for (const st of g.seatState) {
+    if (st && st.skipTurns < 0) st.skipTurns = 0;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -443,6 +689,16 @@ export function pickAutoMove(g, seat) {
   return pool[Math.floor(Math.random() * pool.length)] || moves[0];
 }
 
+/**
+ * 超时托管：处于「跳过回合」状态时直接跳过；否则走一步。
+ * 返回 { type:'move', r, c } 或 { type:'skip' }，无事可做返回 null。
+ */
+export function pickAutoAction(g, seat) {
+  if (isSkipped(g, seat)) return { type: 'skip' };
+  const mv = pickAutoMove(g, seat);
+  return mv ? { type: 'move', r: mv.r, c: mv.c } : null;
+}
+
 /** 给 UI 用的可读原因。 */
 export const REASON_TEXT = {
   'not-playing': '对局尚未开始',
@@ -455,6 +711,16 @@ export const REASON_TEXT = {
   cross: '路障不能交叉',
   'seal-player': '这面墙会让有玩家无法抵达中央',
   'seal-goal': '这面墙会把中央方块完全封死',
+  skipped: '你踩中了陷阱，本回合无法行动',
+  'no-wall': '这里没有可以破坏的路障',
+  'own-wall': '不能破坏自己的路障',
+  'trap-on-goal': '陷阱不能放在中央方块上',
+  'trap-occupied': '这里已经有一个陷阱了',
+  'bad-item': '没有这种道具',
+  'no-item': '你没有这件道具',
+  'item-full': '道具已满，先用掉一件再来',
+  'no-chest': '这里没有宝箱',
+  'chest-used': '这个宝箱你已经开过了',
   unknown: '无法放置',
 };
 

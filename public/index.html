@@ -75,6 +75,47 @@
             </select>
           </label>
 
+          <div class="field-group">
+            <label class="field">
+              <span>宝箱数量</span>
+              <select id="in-chests" class="input">
+                <option value="0" selected>不生成</option>
+                <option value="1">1 个</option>
+                <option value="2">2 个</option>
+                <option value="3">3 个</option>
+                <option value="5">5 个</option>
+                <option value="8">8 个</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>宝箱存续</span>
+              <select id="in-chest-mode" class="input">
+                <option value="1" selected>只能用一次</option>
+                <option value="0">一直存在</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>道具栏上限</span>
+            <select id="in-item-slots" class="input">
+              <option value="1">1 件</option>
+              <option value="2">2 件</option>
+              <option value="3" selected>3 件</option>
+              <option value="4">4 件</option>
+              <option value="5">5 件</option>
+            </select>
+          </label>
+
+          <div class="field">
+            <span>宝箱可产出道具</span>
+            <div class="item-toggles" id="in-chest-items">
+              <label class="item-toggle"><input type="checkbox" value="teleport" checked><span>🎲 随机传送</span></label>
+              <label class="item-toggle"><input type="checkbox" value="break" checked><span>🔨 破墙</span></label>
+              <label class="item-toggle"><input type="checkbox" value="trap" checked><span>💣 陷阱</span></label>
+            </div>
+          </div>
+
           <button type="submit" class="btn primary">创建房间</button>
           <p class="hint">创建后把邀请码发给朋友，对方输入即可加入。</p>
         </form>
@@ -165,6 +206,15 @@
               </button>
             </div>
           </div>
+
+          <!-- 道具栏 -->
+          <div class="itembar hidden" id="itembar">
+            <div class="itembar-head">
+              <span class="ib-title">我的道具</span>
+              <span class="ib-hint" id="items-hint">踩到宝箱格随机获得 · 每回合限用一件</span>
+            </div>
+            <div class="itembar-slots" id="items-slots"></div>
+          </div>
         </div>
 
         <aside class="side">
@@ -205,6 +255,35 @@
                   <option value="1">1 格</option><option value="2">2 × 2</option>
                 </select>
               </label>
+              <div class="field-group">
+                <label class="field"><span>宝箱数量</span>
+                  <select id="s-chests" class="input">
+                    <option value="0">不生成</option><option value="1">1</option>
+                    <option value="2">2</option><option value="3">3</option>
+                    <option value="5">5</option><option value="8">8</option>
+                  </select>
+                </label>
+                <label class="field"><span>宝箱存续</span>
+                  <select id="s-chest-mode" class="input">
+                    <option value="1">只能用一次</option><option value="0">一直存在</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field"><span>道具栏上限</span>
+                <select id="s-item-slots" class="input">
+                  <option value="1">1 件</option><option value="2">2 件</option>
+                  <option value="3">3 件</option><option value="4">4 件</option>
+                  <option value="5">5 件</option>
+                </select>
+              </label>
+              <div class="field">
+                <span>宝箱可产出道具</span>
+                <div class="item-toggles" id="s-chest-items">
+                  <label class="item-toggle"><input type="checkbox" value="teleport"><span>🎲 随机传送</span></label>
+                  <label class="item-toggle"><input type="checkbox" value="break"><span>🔨 破墙</span></label>
+                  <label class="item-toggle"><input type="checkbox" value="trap"><span>💣 陷阱</span></label>
+                </div>
+              </div>
               <button type="submit" class="btn small" id="btn-apply-settings">保存设置</button>
             </form>
           </div>
@@ -224,8 +303,23 @@
           </div>
         </aside>
       </main>
+
+      <!-- 弹幕输入条 -->
+      <div class="danmaku-bar">
+        <input id="danmaku-input" class="input" maxlength="40" placeholder="发一条弹幕，会飘过所有人的屏幕…" autocomplete="off">
+        <button id="btn-danmaku" class="btn small" type="button">发送</button>
+      </div>
     </section>
   </div>
+
+  <!-- 弹幕层：从右往左飘过 -->
+  <div id="danmaku-layer" class="danmaku-layer" aria-hidden="true"></div>
+
+  <!-- 头像互动飘出的表情选择条 -->
+  <div id="reaction-picker" class="reaction-picker hidden"></div>
+
+  <!-- 互动 / 陷阱等全屏特效 -->
+  <div id="fx-layer" class="fx-layer" aria-hidden="true"></div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 

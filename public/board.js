@@ -42,6 +42,10 @@ export class BoardView {
     this.hoverWall = null;  // {d,r,c} | null
     this.wallPreview = null;// {d,r,c,ok,reason}
     this.winnerSeat = -1;
+    this.traps = [];        // 只有自己埋的陷阱会出现在这里
+    this.breakHover = null; // {wall, ok} 破墙模式下悬停的路障
+    this.trapHover = null;  // {r,c}
+    this.teleportFlash = null; // {seat, at} 随机传送的落点闪光
 
     this._resize();
     if (typeof ResizeObserver !== 'undefined') {
@@ -69,6 +73,7 @@ export class BoardView {
   setGame(game, phase) {
     this.state = game;
     this.phase = phase;
+    this.traps = game?.traps || [];
     this._resize();
   }
 
@@ -118,6 +123,25 @@ export class BoardView {
       if (!best || score < best.score) best = { d: 'v', r, c: vCol, score };
     }
     return best;
+  }
+
+  /**
+   * 命中场上已有的某面路障（破墙道具用）。
+   * 返回 { index, wall, score }，没有命中返回 null。
+   */
+  hitExistingWall(px, py) {
+    const walls = this.state?.walls || [];
+    if (!walls.length) return null;
+    const g = this.toGrid(px, py);
+    let best = null;
+    walls.forEach((wl, index) => {
+      // 墙身是一条线段：横墙 y=r / 竖墙 x=c，区间各自跨两格
+      const dist = wl.d === 'h'
+        ? Math.hypot(g.y - wl.r, g.x < wl.c ? wl.c - g.x : g.x > wl.c + 2 ? g.x - (wl.c + 2) : 0)
+        : Math.hypot(g.x - wl.c, g.y < wl.r ? wl.r - g.y : g.y > wl.r + 2 ? g.y - (wl.r + 2) : 0);
+      if (!best || dist < best.score) best = { index, wall: wl, score: dist };
+    });
+    return best && best.score < 0.85 ? best : null;
   }
 
   /* ---------------- 绘制 ---------------- */
@@ -213,9 +237,41 @@ export class BoardView {
       ctx.fill();
     }
 
+    // 宝箱
+    for (const chest of this._visibleChests()) {
+      this._drawChest(chest, time);
+    }
+
+    // 自己埋的陷阱（只有本人能看到自己的陷阱）
+    for (const trap of this.traps || []) {
+      this._drawTrap(trap, time);
+    }
+
+    // 陷阱落点预览
+    if (this.trapHover) {
+      const { r, c } = this.trapHover;
+      const cx = this.px(c + 0.5);
+      const cy = this.px(r + 0.5);
+      ctx.save();
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      ctx.arc(cx, cy, cell * 0.34, 0, Math.PI * 2);
+      ctx.strokeStyle = '#ff3d6e';
+      ctx.setLineDash([cell * 0.12, cell * 0.1]);
+      ctx.lineWidth = cell * 0.055;
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // 路障
     for (const wl of this.state.walls || []) {
       this._drawWall(wl.d, wl.r, wl.c, colorOf(wl.seat), 1);
+    }
+
+    // 破墙预览：高亮悬停到的路障
+    if (this.breakHover?.wall) {
+      const wl = this.breakHover.wall;
+      this._drawWall(wl.d, wl.r, wl.c, this.breakHover.ok ? '#ff7a3d' : '#ff5470', 1, true);
     }
 
     // 放墙预览
@@ -293,11 +349,97 @@ export class BoardView {
     ctx.stroke();
   }
 
-  /** 三层霓虹：外发光 -> 主体 -> 亮芯 */
-  _drawWall(d, r, c, color, alpha) {
+  /**
+   * 当前玩家能看到的宝箱。
+   * - 常驻模式（chestMode='forever'）：所有人都看得到，只是自己开过的会画成「已开」的灰箱
+   * - 一次性模式（'once'）：被任何人开过之后就从场上消失
+   */
+  _visibleChests() {
+    const chests = this.state?.chests || [];
+    if (this.state?.chestMode === 'once') return chests.filter((ch) => !(ch.openedBy || []).length);
+    return chests;
+  }
+
+  _drawChest(chest, time) {
     const ctx = this.ctx;
     const cell = this.cell;
-    const w = cell * 0.24;
+    const openedByMe = (chest.openedBy || []).includes(this.mySeat);
+    const x = this.px(chest.c) + cell * 0.2;
+    const y = this.px(chest.r) + cell * 0.26;
+    const w = cell * 0.6;
+    const h = cell * 0.48;
+    const pulse = 0.5 + 0.5 * Math.sin(time / 500);
+    const gold = openedByMe ? '#6a6a76' : '#ffc23d';
+
+    ctx.save();
+    if (!openedByMe) {
+      ctx.shadowColor = gold;
+      ctx.shadowBlur = cell * (0.3 + pulse * 0.25);
+    }
+    // 箱体
+    this._roundRect(ctx, x, y + h * 0.34, w, h * 0.66, cell * 0.06);
+    ctx.fillStyle = openedByMe ? '#3a3a44' : '#a86a1f';
+    ctx.fill();
+    // 箱盖
+    this._roundRect(ctx, x, y, w, h * 0.46, cell * 0.06);
+    ctx.fillStyle = gold;
+    ctx.fill();
+    // 锁扣
+    ctx.beginPath();
+    ctx.arc(x + w / 2, y + h * 0.42, cell * 0.06, 0, Math.PI * 2);
+    ctx.fillStyle = openedByMe ? '#26262e' : '#fff3c4';
+    ctx.fill();
+    ctx.restore();
+
+    if (openedByMe) {
+      // 自己已经开过：打一个勾，避免白跑一趟
+      ctx.save();
+      ctx.strokeStyle = 'rgba(46,227,107,.9)';
+      ctx.lineWidth = cell * 0.06;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x + w * 0.24, y + h * 0.62);
+      ctx.lineTo(x + w * 0.44, y + h * 0.84);
+      ctx.lineTo(x + w * 0.78, y + h * 0.4);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  /** 只有自己能看到自己的陷阱，所以画得张扬一点也无妨。 */
+  _drawTrap(trap, time) {
+    const ctx = this.ctx;
+    const cell = this.cell;
+    const cx = this.px(trap.c + 0.5);
+    const cy = this.px(trap.r + 0.5);
+    const pulse = 0.5 + 0.5 * Math.sin(time / 420);
+
+    ctx.save();
+    ctx.globalAlpha = 0.35 + pulse * 0.3;
+    ctx.shadowColor = '#ff3d6e';
+    ctx.shadowBlur = cell * 0.4;
+    ctx.beginPath();
+    ctx.arc(cx, cy, cell * 0.3, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ff3d6e';
+    ctx.setLineDash([cell * 0.1, cell * 0.08]);
+    ctx.lineWidth = cell * 0.05;
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.font = `${Math.round(cell * 0.42)}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('💣', cx, cy + cell * 0.02);
+    ctx.restore();
+  }
+
+  /** 三层霓虹：外发光 -> 主体 -> 亮芯 */
+  _drawWall(d, r, c, color, alpha, highlight = false) {
+    const ctx = this.ctx;
+    const cell = this.cell;
+    const w = cell * (highlight ? 0.32 : 0.24);
     let x1, y1, x2, y2;
     if (d === 'h') {
       x1 = this.px(c); y1 = this.px(r);

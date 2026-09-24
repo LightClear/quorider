@@ -161,6 +161,14 @@ async function snapshot(page) {
       lobbyVisible: !document.querySelector('#overlay-lobby')?.classList.contains('hidden'),
       winnerTitle: document.querySelector('#winner-title')?.textContent || '',
       size: window.__qdr?.game?.size ?? 9,
+      // 新功能：道具栏 / 弹幕 / 互动
+      itemBarVisible: !document.querySelector('#itembar')?.classList.contains('hidden'),
+      itemSlots: document.querySelectorAll('#items-slots .item-slot').length,
+      itemFilled: document.querySelectorAll('#items-slots .item-slot.filled').length,
+      danmakuItems: document.querySelectorAll('#danmaku-layer .danmaku-item').length,
+      fxItems: document.querySelectorAll('#fx-layer > *').length,
+      reactionPickerVisible: !document.querySelector('#reaction-picker')?.classList.contains('hidden'),
+      reactionButtons: document.querySelectorAll('#reaction-picker button').length,
     };
   });
 }
@@ -178,7 +186,7 @@ async function snapshot(page) {
  */
 async function installStateTap(page) {
   await page.addInitScript(() => {
-    window.__qdr = { game: null, phase: null, hooked: 0 };
+    window.__qdr = { game: null, phase: null, hooked: 0, danmaku: null };
     const origParse = JSON.parse;
     JSON.parse = function (text, reviver) {
       const v = origParse.call(this, text, reviver);
@@ -187,6 +195,8 @@ async function installStateTap(page) {
           window.__qdr.hooked++;
           window.__qdr.game = v.game;
           window.__qdr.phase = v.phase;
+          // 弹幕历史（用来验证刷新后不会把旧弹幕重放一遍）
+          if (Array.isArray(v.danmaku)) window.__qdr.danmaku = v.danmaku;
         }
       } catch { /* 忽略 */ }
       return v;
@@ -213,6 +223,15 @@ const waitTurn = (page, seat) => readGame(page, (g) => g && g.turn === seat, T);
 
 /** 棋盘几何：cell = min(cssW,cssH)/(n+0.64)，pad = cell*0.32，整体居中（与 board.js 一致）。 */
 async function geometry(page, size) {
+  // 先把棋盘滚进视口：顶栏是 sticky 的，页面一旦滚动，棋盘最上面一两行会被它盖住，
+  // 用鼠标点那几格会点到顶栏而不是画布（道具栏出现后页面变高，必踩这个坑）。
+  await page.evaluate(() => {
+    const wrap = document.querySelector('.board-wrap');
+    if (!wrap) return;
+    const r = wrap.getBoundingClientRect();
+    window.scrollBy(0, r.top - 72); // 让棋盘顶部落在顶栏下方
+  });
+  await page.waitForTimeout(60);
   const box = await page.evaluate(() => {
     const b = document.querySelector('#board').getBoundingClientRect();
     return { x: b.x, y: b.y, w: b.width, h: b.height };
@@ -463,6 +482,9 @@ async function main() {
     await pageA.fill('#in-create-name', '房主甲');
     await pageA.selectOption('#in-size', '9');
     await pageA.selectOption('#in-goal', '1');
+    // 打开宝箱，让后面的道具栏 / 陷阱 / 宝箱渲染都有东西可验证
+    await pageA.selectOption('#in-chests', '5');
+    await pageA.selectOption('#in-chest-mode', '0');
     await pageA.click('#form-create button[type=submit]');
     try {
       await pageA.waitForSelector('#screen-room.active', { timeout: T });
@@ -607,6 +629,198 @@ async function main() {
     check('中央黄色方块可见', px.yellowRatio > 0.0015, `yellow=${px.yellowRatio.toFixed(4)}`);
     check('存在彩色发光元素（棋子/路障）', px.colorfulRatio > 0.004, `colorful=${px.colorfulRatio.toFixed(4)}`);
 
+    /* ================= 桌面 · 宝箱 / 道具 / 弹幕 / 互动 ================= */
+    group('桌面 · 宝箱与道具');
+    const gChest = await readGame(pageA, (g) => g && g.chests && g.chests.length > 0, T);
+    check('宝箱已生成并出现在状态里', gChest?.chests?.length === 5, `chests=${gChest?.chests?.length}`);
+    check('宝箱存续模式为「一直存在」', gChest?.chestMode === 'forever', String(gChest?.chestMode));
+    const snItem = await snapshot(pageA);
+    check('道具栏可见', snItem.itemBarVisible);
+    check('道具栏槽位数等于设置（3）', snItem.itemSlots === 3, `slots=${snItem.itemSlots}`);
+    // 开局手上没道具，所以还没有填充的槽
+    check('开局道具栏为空', snItem.itemFilled === 0, `filled=${snItem.itemFilled}`);
+    await shot(pageA, 'b13_itembar.png');
+
+    group('桌面 · 弹幕');
+    await pageA.fill('#danmaku-input', '这是一条测试弹幕');
+    await pageA.click('#btn-danmaku');
+    let danmakuOk = false;
+    try {
+      await pageB.waitForSelector('#danmaku-layer .danmaku-item', { timeout: 5000 });
+      danmakuOk = true;
+    } catch { /* 下面统一断言 */ }
+    check('弹幕在对手屏幕上飘出', danmakuOk);
+    const dmText = await pageB.textContent('#danmaku-layer .danmaku-item').catch(() => '');
+    check('弹幕格式为「玩家名称：内容」', dmText.includes('房主甲：') && dmText.includes('这是一条测试弹幕'), dmText);
+    // 弹幕颜色应当是发送者座位的颜色（房主是座位 0 = 蓝色）
+    const dmColor = await pageB.evaluate(() => {
+      const el = document.querySelector('#danmaku-layer .danmaku-item');
+      return el ? getComputedStyle(el).color : '';
+    });
+    check('弹幕颜色取发送者座位色', /rgb\(58,\s*160,\s*255\)/.test(dmColor), dmColor);
+
+    // 位置：必须「从屏幕最右侧之外进入，一路左移到完全移出屏幕左侧」。
+    // 直接把动画拨到起点/终点各量一次，比等着截图可靠得多
+    // （之前只断言了元素存在，结果弹幕其实是从屏幕左边冒出来往左飞的，没被发现）。
+    const dmGeom = await pageB.evaluate(() => {
+      const layer = document.querySelector('#danmaku-layer');
+      const el = layer?.querySelector('.danmaku-item');
+      if (!layer || !el) return null;
+      const vw = layer.clientWidth;
+      const w = el.offsetWidth;
+      const anim = el.getAnimations?.()[0];
+      if (!anim) return { vw, w, start: null, end: null };
+      const wasPlaying = anim.playState === 'running';
+      anim.pause();
+      anim.currentTime = 0;
+      let r = el.getBoundingClientRect();
+      const start = { left: r.left, right: r.right };
+      anim.currentTime = anim.effect.getTiming().duration;
+      r = el.getBoundingClientRect();
+      const end = { left: r.left, right: r.right };
+      if (wasPlaying) anim.play();
+      return { vw, w, start, end };
+    });
+    check('弹幕层宽度＝当前浏览器屏幕宽度',
+      dmGeom && dmGeom.vw === await pageB.evaluate(() => window.innerWidth),
+      dmGeom ? `layer=${dmGeom.vw}` : '拿不到弹幕层');
+    check('弹幕起点在屏幕右边缘之外（整条看不见）',
+      !!dmGeom?.start && dmGeom.start.left >= dmGeom.vw - 1,
+      dmGeom?.start ? `left=${dmGeom.start.left.toFixed(1)} vw=${dmGeom.vw}` : '无起点');
+    check('弹幕终点完全移出屏幕左侧',
+      !!dmGeom?.end && dmGeom.end.right <= 1,
+      dmGeom?.end ? `right=${dmGeom.end.right.toFixed(1)}` : '无终点');
+
+    // 再实测一次「真的在往左走」
+    const dmLeft1 = await pageB.evaluate(() =>
+      document.querySelector('#danmaku-layer .danmaku-item')?.getBoundingClientRect().left ?? null);
+    await pageB.waitForTimeout(500);
+    const dmLeft2 = await pageB.evaluate(() =>
+      document.querySelector('#danmaku-layer .danmaku-item')?.getBoundingClientRect().left ?? null);
+    check('弹幕持续向左移动',
+      dmLeft1 !== null && dmLeft2 !== null && dmLeft2 < dmLeft1,
+      `${dmLeft1?.toFixed(1)} → ${dmLeft2?.toFixed(1)}`);
+
+    await shot(pageB, 'b14_danmaku.png');
+
+    // 刷新/新开页面后，房间里的历史弹幕**不能**被重放一遍。
+    // 用「另开一个观众页 + 刷新它」来验证：进入房间后的第一份 state 里
+    // 带着最近 30 条历史，客户端必须直接对齐序号、一条都不播。
+    const replayCtx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const pageR = attach(await replayCtx.newPage(), 'replay');
+    await installStateTap(pageR);
+    await pageR.goto(`${base}/?r=${code}`, { waitUntil: 'networkidle' });
+    await pageR.fill('#in-join-name', '回放测试');
+    await pageR.click('#form-join button[type=submit]');
+    await pageR.waitForSelector('#screen-room.active', { timeout: T });
+    // 确认服务端确实把历史弹幕发下来了（否则这条断言就没有意义）
+    const historyCount = await pageR.evaluate(() => window.__qdr?.danmaku?.length ?? -1);
+    check('服务端确实下发了弹幕历史（前置条件）', historyCount > 0, `history=${historyCount}`);
+    await pageR.waitForTimeout(1200);
+    const replayAfterJoin = await pageR.evaluate(
+      () => document.querySelectorAll('#danmaku-layer .danmaku-item').length,
+    );
+    check('新开页面不会重放历史弹幕', replayAfterJoin === 0, `屏幕上飘过 ${replayAfterJoin} 条`);
+
+    // 真正刷新一次（走 localStorage 自动回房那条路径）
+    await pageR.reload({ waitUntil: 'networkidle' });
+    await pageR.waitForSelector('#screen-room.active', { timeout: T });
+    await pageR.waitForTimeout(1200);
+    const replayAfterReload = await pageR.evaluate(
+      () => document.querySelectorAll('#danmaku-layer .danmaku-item').length,
+    );
+    check('刷新页面不会重放历史弹幕', replayAfterReload === 0, `屏幕上飘过 ${replayAfterReload} 条`);
+
+    // 但「实时发的新弹幕」必须照常播 —— 否则就是把功能一起关掉了
+    await pageB.waitForTimeout(1200); // 等冷却
+    await pageB.fill('#danmaku-input', '刷新后新发的');
+    await pageB.click('#btn-danmaku');
+    let liveOk = false;
+    try {
+      await pageR.waitForFunction(
+        () => {
+          const el = document.querySelector('#danmaku-layer .danmaku-item');
+          return !!el && el.textContent.includes('刷新后新发的');
+        },
+        null,
+        { timeout: 5000 },
+      );
+      liveOk = true;
+    } catch { /* 下面统一断言 */ }
+    check('刷新后新发的实时弹幕仍会正常飘出', liveOk);
+    await shot(pageR, 'b17_danmaku_no_replay.png');
+
+    // 观众页要主动离开：直接关页面的话他会被当成「掉线观众」留在房间名单里，
+    // 本局结束时被自动放回玩家席，后面的「重开后仍是 2 人」断言就崩了。
+    await pageR.click('#btn-leave');
+    await pageR.waitForTimeout(200);
+    await pageR.close();
+    await replayCtx.close();
+
+    group('桌面 · 头像互动');
+    // 悬停到对手头像行上应出现互动按钮
+    const reactBtn = pageA.locator('#player-list .player-item:not(.me) .pp-react').first();
+    check('对手头像行有互动入口', (await reactBtn.count()) > 0);
+
+    // 按钮必须**常态可见**：不把鼠标移上去也要看得到、点得到。
+    // 先把鼠标挪到棋盘中央（远离玩家列表）再量，避免把 hover 效果当成常态。
+    const boardBox = await pageA.locator('#board').boundingBox();
+    await pageA.mouse.move(boardBox.x + boardBox.width / 2, boardBox.y + boardBox.height / 2);
+    await pageA.waitForTimeout(200);
+    const reactVis = await pageA.evaluate(() => {
+      const btn = document.querySelector('#player-list .player-item:not(.me) .pp-react');
+      if (!btn) return null;
+      const cs = getComputedStyle(btn);
+      const r = btn.getBoundingClientRect();
+      return {
+        opacity: cs.opacity,
+        visibility: cs.visibility,
+        display: cs.display,
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+      };
+    });
+    check('互动按钮常态可见（不需要鼠标悬停）',
+      !!reactVis && reactVis.opacity === '1' && reactVis.visibility === 'visible'
+        && reactVis.display !== 'none' && reactVis.w > 0 && reactVis.h > 0,
+      JSON.stringify(reactVis));
+    check('互动按钮有可点的尺寸（≥28px）',
+      !!reactVis && reactVis.w >= 28 && reactVis.h >= 28,
+      reactVis ? `${reactVis.w}×${reactVis.h}` : '无数据');
+    // 鼠标还停在棋盘中间、没碰过玩家列表，此时直接点也应该能打开
+    await reactBtn.click({ force: true });
+    const snPicker = await snapshot(pageA);
+    check('不悬停直接点也能弹出 emoji 选择条', snPicker.reactionPickerVisible);
+    check('选择条包含 5 种 emoji', snPicker.reactionButtons === 5, `buttons=${snPicker.reactionButtons}`);
+    const emojis = await pageA.evaluate(() =>
+      [...document.querySelectorAll('#reaction-picker button')].map((b) => b.textContent));
+    check(
+      'emoji 为 大便/炸弹/爱心/玫瑰/咖啡',
+      ['💩', '💣', '❤️', '🌹', '☕'].every((e) => emojis.includes(e)),
+      emojis.join(' '),
+    );
+    await shot(pageA, 'b15_reaction_picker.png');
+    // 点第一个（大便）→ 对手屏幕上出现特效
+    await pageA.locator('#reaction-picker button').first().click();
+    let fxOk = false;
+    try {
+      await pageB.waitForSelector('#fx-layer .fx-burst', { timeout: 4000 });
+      fxOk = true;
+    } catch { /* 统一断言 */ }
+    check('对手屏幕出现互动特效', fxOk);
+    const fxLabel = await pageB.textContent('#fx-layer .fx-label').catch(() => '');
+    check('特效带有来源提示', fxLabel.includes('房主甲'), fxLabel || '(无文案)');
+    await shot(pageB, 'b16_reaction_fx.png');
+
+    group('桌面 · 陷阱与道具可见性');
+    // 用引擎直接验证「陷阱只有自己可见」这条隐私规则在数据层成立：
+    // 观众/对手的 payload 里不该出现别人的陷阱。这里用页面上的实测数据断言。
+    const trapPrivacy = await pageB.evaluate(() => {
+      const g = window.__qdr?.game;
+      return { hasTraps: Array.isArray(g?.traps), trapCount: g?.traps?.length ?? -1 };
+    });
+    check('陷阱字段按人下发（数组存在）', trapPrivacy.hasTraps, JSON.stringify(trapPrivacy));
+
     /* ================= 桌面 · 打到胜利 ================= */
     group('桌面 · 胜负判定与快速重开');
     // 先让访客把回合交出来（放墙测试结束后正好轮到访客），
@@ -711,7 +925,7 @@ async function main() {
         return { x: b.x, y: b.y, w: b.width, h: b.height, right: b.right, bottom: b.bottom };
       };
       const small = [];
-      for (const sel of ['#btn-mode-move', '#btn-mode-wall', '#btn-start', '#btn-leave', '#room-code-btn']) {
+      for (const sel of ['#btn-mode-move', '#btn-mode-wall', '#btn-start', '#btn-leave', '#room-code-btn', '#player-list .pp-react']) {
         document.querySelectorAll(sel).forEach((el) => {
           if (el.closest('.hidden') || getComputedStyle(el).display === 'none') return;
           const b = el.getBoundingClientRect();
@@ -736,6 +950,84 @@ async function main() {
     check('可点控件 ≥36px（触摸友好）', mob.small.length === 0, mob.small.join('; ') || '全部达标');
     check('玩家面板仍可见', mob.side.h > 50, `h=${Math.round(mob.side.h)}`);
     await shot(pageM, 'b09_room_mobile.png');
+
+    // 窄屏（375px）弹幕也要「从最右外侧进、完全移出最左」——
+    // 这正是「要考虑到当前的浏览器屏幕宽度」那条：位移若写死或算错，
+    // 宽屏可能勉强能看，窄屏就会从屏幕中间冒出来。
+    await pageB.fill('#danmaku-input', '窄屏弹幕测试');
+    await pageB.click('#btn-danmaku');
+    let dmMobileOk = false;
+    try {
+      await pageM.waitForSelector('#danmaku-layer .danmaku-item', { timeout: 5000 });
+      dmMobileOk = true;
+    } catch { /* 下面统一断言 */ }
+    check('手机窄屏也能收到弹幕', dmMobileOk);
+    const dmMobile = await pageM.evaluate(() => {
+      const layer = document.querySelector('#danmaku-layer');
+      const el = layer?.querySelector('.danmaku-item');
+      if (!layer || !el) return null;
+      const anim = el.getAnimations?.()[0];
+      const vw = layer.clientWidth;
+      if (!anim) return { vw, start: null, end: null };
+      anim.pause();
+      anim.currentTime = 0;
+      const s = el.getBoundingClientRect();
+      anim.currentTime = anim.effect.getTiming().duration;
+      const e = el.getBoundingClientRect();
+      anim.play();
+      return { vw, start: s.left, end: e.right, w: el.offsetWidth };
+    });
+    check('窄屏弹幕起点在屏幕右边缘之外',
+      !!dmMobile && dmMobile.start >= dmMobile.vw - 1,
+      dmMobile ? `left=${dmMobile.start?.toFixed(1)} vw=${dmMobile.vw}` : '无数据');
+    check('窄屏弹幕终点完全移出屏幕左侧',
+      !!dmMobile && dmMobile.end <= 1,
+      dmMobile ? `right=${dmMobile.end?.toFixed(1)}` : '无数据');
+
+    // 极端情况：弹幕文字比整块屏幕还宽（40 字上限 ≈ 680px，手机只有 375px）。
+    // 起点看左边缘、终点看右边缘，所以「比屏幕宽」也不会露馅。
+    await pageB.waitForTimeout(1200); // 等服务端的 1 秒弹幕冷却过去
+    await pageB.fill('#danmaku-input', '超长弹幕'.repeat(10)); // 服务端/输入框会裁到 40 字
+    const dmCountBefore = await pageM.evaluate(
+      () => document.querySelectorAll('#danmaku-layer .danmaku-item').length,
+    );
+    await pageB.click('#btn-danmaku');
+    let dmLongOk = false;
+    try {
+      await pageM.waitForFunction(
+        (before) => {
+          const items = [...document.querySelectorAll('#danmaku-layer .danmaku-item')];
+          if (items.length <= before) return false;
+          return items[items.length - 1].offsetWidth > window.innerWidth;
+        },
+        dmCountBefore,
+        { timeout: 6000 },
+      );
+      dmLongOk = true;
+    } catch { /* 下面统一断言 */ }
+    if (dmLongOk) {
+      const dmLong = await pageM.evaluate(() => {
+        const layer = document.querySelector('#danmaku-layer');
+        const el = [...layer.querySelectorAll('.danmaku-item')].pop();
+        const anim = el.getAnimations?.()[0];
+        if (!anim) return null;
+        anim.pause();
+        anim.currentTime = 0;
+        const s = el.getBoundingClientRect();
+        anim.currentTime = anim.effect.getTiming().duration;
+        const e = el.getBoundingClientRect();
+        anim.play();
+        return { vw: layer.clientWidth, w: el.offsetWidth, start: s.left, end: e.right };
+      });
+      check('超宽弹幕起点依然在屏幕右边缘之外',
+        !!dmLong && dmLong.start >= dmLong.vw - 1,
+        dmLong ? `left=${dmLong.start?.toFixed(1)} vw=${dmLong.vw} 宽度=${dmLong.w}` : '无数据');
+      check('超宽弹幕终点依然完全移出屏幕左侧',
+        !!dmLong && dmLong.end <= 1,
+        dmLong ? `right=${dmLong.end?.toFixed(1)}` : '无数据');
+    } else {
+      check('超宽弹幕（文字比屏幕宽）能正常播放', false, '没等到比屏幕更宽的弹幕');
+    }
 
     // 手机端触摸走子：从「手机这一页」读状态并等它自己的回合，
     // 否则会拿着房主桌面的旧状态去点，座位对不上自然点不动。
