@@ -43,6 +43,109 @@ test('不限时房间：被陷阱困住的人会被自动跳过（防卡死）',
   assert.equal(room.game.turn, seatOf(room, 'g'), '回合交给下一个人');
 });
 
+/**
+ * 回归：**限时房间**里踩中陷阱的人，轮到他时必须立刻被跳过，
+ * 而不是干等自己那一回合的倒计时走完。
+ *
+ * 老实现只在 `!room.deadline`（不限时）分支里兜底跳过，
+ * 限时房间要等 turnTimer 秒耗尽才跳，看起来就像「根本不会自动跳过」。
+ */
+test('限时房间：轮到被陷阱困住的人时立刻跳过，不等倒计时', () => {
+  const { m, room } = makeRoom({ turnTimer: 60 });
+  const victim = seatOf(room, 'h');
+  const other = seatOf(room, 'g');
+
+  room.game.seatState[victim].skipTurns = 1;
+  // 倒计时是「刚刚续上」的，远没到点
+  assert.ok(room.deadline > Date.now() + 50000, '前置条件：倒计时还早');
+
+  const changed = m.tick(room);
+
+  assert.equal(changed, true, 'tick 应该报告状态有变化');
+  assert.equal(room.game.seatState[victim].skipTurns, 0, '跳过标记应被消耗');
+  assert.equal(room.game.turn, other, '回合应立刻交给下一个人');
+  assert.equal(room.game.lastMove?.type, 'skip', '这一手应该记成 skip');
+});
+
+test('限时房间：换手动作一结束就结算跳过（不用等 tick）', () => {
+  const { m, room } = makeRoom({ turnTimer: 60 });
+  const victim = seatOf(room, 'h');
+  const other = seatOf(room, 'g');
+
+  // 对手走一步，把回合交给「踩过陷阱」的座位
+  room.game.turn = other;
+  room.game.seatState[victim].skipTurns = 1;
+  m.move(room, 'g', { r: 1, c: 4 });
+
+  assert.equal(room.game.seatState[victim].skipTurns, 0, '跳过标记应被消耗');
+  assert.equal(room.game.turn, other, '跳过之后应回到对手，而不是停在受害者身上');
+});
+
+test('限时房间：放墙换手后同样立刻结算跳过', () => {
+  const { m, room } = makeRoom({ turnTimer: 60, walls: 5 });
+  const victim = seatOf(room, 'h');
+  const other = seatOf(room, 'g');
+
+  room.game.turn = other;
+  room.game.seatState[victim].skipTurns = 1;
+  const res = m.placeWall(room, 'g', { d: 'h', r: 4, c: 3 });
+  assert.ok(!res.error, `放墙不该失败：${res.error}`);
+
+  assert.equal(room.game.seatState[victim].skipTurns, 0);
+  assert.equal(room.game.turn, other, '跳过之后回合回到对手');
+});
+
+test('连续两个人被困住时会一路跳过，直到轮到能行动的人', () => {
+  const m = new RoomManager();
+  const room = m.createRoom({ pid: 'h', name: '房主', settings: { size: 9, maxPlayers: 4, turnTimer: 60 } });
+  m.joinRoom({ code: room.code, pid: 'b', name: '乙' });
+  m.joinRoom({ code: room.code, pid: 'c', name: '丙' });
+  m.startGame(room, 'h');
+  assert.equal(room.game.seats.length, 3);
+
+  // 座位 0 和 1 都被困住，当前正好轮到座位 0
+  room.game.turn = 0;
+  room.game.seatState[0].skipTurns = 1;
+  room.game.seatState[1].skipTurns = 1;
+
+  const changed = m.tick(room);
+  assert.equal(changed, true);
+  assert.equal(room.game.seatState[0].skipTurns, 0);
+  assert.equal(room.game.seatState[1].skipTurns, 0);
+  assert.equal(room.game.turn, 2, '一路跳到第一个能行动的人');
+});
+
+test('跳过不会死循环：全员都被困住时也只是各跳一次', () => {
+  const { m, room } = makeRoom({ turnTimer: 60 });
+  room.game.turn = 0;
+  room.game.seatState[0].skipTurns = 1;
+  room.game.seatState[1].skipTurns = 1;
+
+  const changed = m.tick(room);
+  assert.equal(changed, true);
+  assert.equal(room.game.seatState[0].skipTurns, 0);
+  assert.equal(room.game.seatState[1].skipTurns, 0);
+  // 两个人都跳完，回到座位 0，且不再有任何跳过标记
+  assert.equal(room.game.turn, 0);
+  assert.equal(m.tick(room), false, '第二次 tick 不该再有事发生');
+});
+
+test('踩中陷阱会私聊受害者一条提示（全场播报之外）', () => {
+  const { m, room } = makeRoom();
+  const sent = [];
+  room.players.get('h').conn = { ready: true, send: (o) => sent.push(o), destroy() {} };
+
+  m._announceTrap(room, seatOf(room, 'h'), { owner: seatOf(room, 'g') });
+
+  const toast = sent.find((o) => o.toast);
+  assert.ok(toast, '受害者应收到一条私聊提示');
+  assert.match(toast.toast, /陷阱/);
+  assert.equal(toast.toastKind, 'warn');
+  // 同时全场日志 + 系统弹幕都要有（「全场播报」）
+  assert.ok(room.log.some((l) => l.text.includes('陷阱')));
+  assert.ok(room.danmaku.some((d) => d.system && d.text.includes('陷阱')));
+});
+
 test('不限时房间：没被困住时 tick 不会乱动回合', () => {
   const { m, room } = makeRoom({ turnTimer: 0 });
   assert.equal(m.tick(room), false);

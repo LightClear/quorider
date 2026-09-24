@@ -325,6 +325,7 @@ export class RoomManager {
     const name = room.game.seats[seat].name;
     room._pushLog(`${name} 放置了一面路障`);
     this._armTimer(room);
+    this._resolveSkips(room);
     return { ok: true };
   }
 
@@ -394,6 +395,7 @@ export class RoomManager {
       g.turnCount++;
       advanceTurnOf(g);
       this._armTimer(room);
+      this._resolveSkips(room);
     } else {
       this._afterAction(room, seat, { opened: extra.opened, trapped: extra.trapped });
     }
@@ -416,6 +418,8 @@ export class RoomManager {
       this._promoteWaitingSpectators(room);
     } else {
       this._armTimer(room);
+      // 换手之后如果正好轮到「踩过陷阱」的人，立刻把他的回合跳过去
+      this._resolveSkips(room);
     }
   }
 
@@ -461,10 +465,11 @@ export class RoomManager {
     });
   }
 
-  /** 踩中陷阱：全场播报，被炸的人下一回合直接跳过。 */
+  /** 踩中陷阱：全场播报（动态 + 系统弹幕），被炸的人下一回合直接跳过。 */
   _announceTrap(room, seat, trap) {
     const g = room.game;
     const victim = g.seats[seat]?.name || '玩家';
+    const victimPid = g.seats[seat]?.id;
     const owner = g.seats[trap.owner]?.name;
     room._pushLog(`💥 ${victim} 踩中了陷阱${owner ? `（${owner} 埋的）` : ''}，下一回合无法行动！`);
     room.danmaku.push({
@@ -477,7 +482,14 @@ export class RoomManager {
       system: true,
     });
     this._trimDanmaku(room);
-    room.pendingToast = { text: `💥 ${victim} 踩中陷阱，下一回合被跳过！`, kind: 'warn' };
+    // 全场播报走日志 + 系统弹幕；再单独给受害者一条明确提示
+    // （原来这里只往 room.pendingToast 塞了个对象，没有任何地方读它 = 白写）
+    if (victimPid) {
+      this.sendTo(room, victimPid, {
+        toast: '💥 你踩中了陷阱，下一回合无法行动',
+        toastKind: 'warn',
+      });
+    }
   }
 
   _trimDanmaku(room) {
@@ -570,10 +582,15 @@ export class RoomManager {
 
   /** 每秒调用：处理超时托管与「陷阱跳过回合」。返回 true 表示状态有变化需要广播。 */
   tick(room) {
-    if (!room.game || room.game.phase !== 'playing' || !room.deadline) {
-      return this._maybeAutoResolveTrap(room);
-    }
     const g = room.game;
+    if (!g || g.phase !== 'playing') return false;
+
+    // 轮到被陷阱困住的人：**立刻**把这一回合跳过去，跟有没有倒计时无关。
+    // （之前这里只在「不限时」分支里兜底，限时房间要等受害者那一回合的倒计时
+    //   整整走完才跳，看起来就像「根本不会自动跳过」。）
+    if (this._resolveSkips(room)) return true;
+
+    if (!room.deadline) return false;
     const seatInfo = g.seats[g.turn];
     const seatPlayer = seatInfo ? room.players.get(seatInfo.id) : null;
     // 当前玩家掉线时暂停倒计时，等他回来
@@ -591,7 +608,7 @@ export class RoomManager {
     const name = seatInfo.name;
     const seat = g.turn;
     if (auto.type === 'skip') {
-      // 踩了陷阱：托管也救不了，直接跳过这一回合
+      // 兜底：正常路径下 _resolveSkips 已经处理过了，这里再保一次
       skipTurn(g, seat);
       room._pushLog(`${name} 被陷阱困住，本回合跳过`);
       this._armTimer(room);
@@ -608,24 +625,34 @@ export class RoomManager {
       if (res.opened) this._grantChestItem(room, seat, res.opened);
       if (res.trapped) this._announceTrap(room, seat, res.trapped);
       this._armTimer(room);
+      this._resolveSkips(room);
     }
     return true;
   }
 
   /**
-   * 没有倒计时（不限时）时，被陷阱困住的玩家没人替他跳过，会一直卡住。
-   * 这里兜底：只要当前玩家处于跳过状态且没有倒计时，就直接替他跳过。
+   * 把「踩中陷阱、本回合不能行动」立刻结算掉：只要当前座位身上还挂着跳过标记，
+   * 就消耗一层并换手，直到轮到一个能正常行动的人为止。
+   *
+   * 任何一次换手之后都要调它——否则受害者要一直等到自己回合的倒计时走完才会被跳过。
+   * 每个座位的 skipTurns 都会递减，循环次数有上限，不会死循环。
    */
-  _maybeAutoResolveTrap(room) {
+  _resolveSkips(room) {
     const g = room.game;
-    if (!g || g.phase !== 'playing' || room.deadline) return false;
-    const st = g.seatState?.[g.turn];
-    if (!st || !(st.skipTurns > 0)) return false;
-    const name = g.seats[g.turn]?.name || '玩家';
-    skipTurn(g, g.turn);
-    room._pushLog(`${name} 被陷阱困住，本回合跳过`);
-    this._armTimer(room);
-    return true;
+    if (!g || g.phase !== 'playing') return false;
+    let changed = false;
+    const limit = (g.seats.length + 1) * 2;
+    for (let i = 0; i < limit; i++) {
+      const st = g.seatState?.[g.turn];
+      if (!st || !(st.skipTurns > 0)) break;
+      const name = g.seats[g.turn]?.name || '玩家';
+      if (!skipTurn(g, g.turn).ok) break;
+      room._pushLog(`💥 ${name} 被陷阱困住，本回合跳过`);
+      changed = true;
+      if (g.phase !== 'playing') break;
+    }
+    if (changed) this._armTimer(room);
+    return changed;
   }
 
   /** 回收空房间。 */

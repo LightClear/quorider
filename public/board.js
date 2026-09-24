@@ -203,40 +203,6 @@ export class BoardView {
       ctx.fill();
     }
 
-    // 合法走法提示
-    if (this.legal.length) {
-      for (const m of this.legal) {
-        const cx = this.px(m.c + 0.5);
-        const cy = this.px(m.r + 0.5);
-        const col = colorOf(this.mySeat);
-        ctx.save();
-        ctx.shadowColor = col;
-        ctx.shadowBlur = cell * 0.3;
-        if (m.kind === 'step') {
-          ctx.beginPath();
-          ctx.arc(cx, cy, cell * 0.1, 0, Math.PI * 2);
-          ctx.fillStyle = hexToRgba(col, 0.85);
-          ctx.fill();
-        } else {
-          ctx.beginPath();
-          ctx.arc(cx, cy, cell * 0.14, 0, Math.PI * 2);
-          ctx.strokeStyle = hexToRgba(col, 0.9);
-          ctx.lineWidth = cell * 0.055;
-          ctx.stroke();
-        }
-        ctx.restore();
-      }
-    }
-
-    // 悬停格高亮
-    if (this.hoverCell && this.mode === 'move') {
-      const x = this.px(this.hoverCell.c) + inset;
-      const y = this.px(this.hoverCell.r) + inset;
-      this._roundRect(ctx, x, y, cell - inset * 2, cell - inset * 2, cell * 0.18);
-      ctx.fillStyle = 'rgba(255,255,255,.06)';
-      ctx.fill();
-    }
-
     // 宝箱
     for (const chest of this._visibleChests()) {
       this._drawChest(chest, time);
@@ -279,6 +245,42 @@ export class BoardView {
       const wp = this.wallPreview;
       const col = wp.ok ? colorOf(this.mySeat) : '#ff5470';
       this._drawWall(wp.d, wp.r, wp.c, col, 0.55);
+    }
+
+    // 合法走法提示 + 悬停高亮。
+    // 这一层必须画在宝箱 / 陷阱 / 路障**之上**：可走格和宝箱格重合时，
+    // 圆点如果先画就会被宝箱图标整个盖住，玩家看不到那一格能走。
+    if (this.legal.length) {
+      for (const m of this.legal) {
+        const cx = this.px(m.c + 0.5);
+        const cy = this.px(m.r + 0.5);
+        const col = colorOf(this.mySeat);
+        ctx.save();
+        ctx.shadowColor = col;
+        ctx.shadowBlur = cell * 0.3;
+        if (m.kind === 'step') {
+          ctx.beginPath();
+          ctx.arc(cx, cy, cell * 0.1, 0, Math.PI * 2);
+          ctx.fillStyle = hexToRgba(col, 0.85);
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.arc(cx, cy, cell * 0.14, 0, Math.PI * 2);
+          ctx.strokeStyle = hexToRgba(col, 0.9);
+          ctx.lineWidth = cell * 0.055;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+
+    // 悬停格高亮
+    if (this.hoverCell && this.mode === 'move') {
+      const x = this.px(this.hoverCell.c) + inset;
+      const y = this.px(this.hoverCell.r) + inset;
+      this._roundRect(ctx, x, y, cell - inset * 2, cell - inset * 2, cell * 0.18);
+      ctx.fillStyle = 'rgba(255,255,255,.06)';
+      ctx.fill();
     }
 
     // 棋子
