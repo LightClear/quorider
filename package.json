@@ -1,0 +1,17 @@
+{
+  "name": "quorider",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "路障棋 Quorider —— 多人在线对战（最多 4 人，先触碰中央方块者胜）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/engine.test.js test/ws-flow.test.js",
+    "test:browser": "node test/browser-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

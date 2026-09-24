@@ -1,0 +1,12 @@
+# 构建上下文瘦身：这些都不该进镜像
+.git
+.gitignore
+node_modules
+.dcs
+gui-test-screenshots
+*.log
+HANDOFF.md
+README.md
+docker-compose.yml
+.env
+test

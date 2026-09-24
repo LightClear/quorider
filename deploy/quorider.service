@@ -1,0 +1,61 @@
+[Unit]
+Description=路障棋 Quorider  multiplayer board game server
+Documentation=https://github.com/your/quorider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/quorider
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+# ---- 监听配置 ----
+# 直接对外服务：HOST=0.0.0.0（默认）
+# nginx 反代：改成 127.0.0.1 只监听本机（更安全）
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=3000
+# 需要时把更多变量写进这个文件（见 deploy/env.example）
+# EnvironmentFile=-/etc/quorider.env
+
+# ---- 日志 ----
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quorider
+
+# ---- 沙箱加固 ----
+# 房间状态全在内存里，进程不需要写任何文件，因此可以只读运行
+DynamicUser=yes
+StateDirectory=quorider
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+# 内存占用很小（每个房间几百字节），按需上调
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
